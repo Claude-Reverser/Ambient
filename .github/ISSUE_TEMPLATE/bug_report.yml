@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible problem with Ambient.
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: Ambient version and macOS version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Explain what you did and what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Relevant details
+      description: Display count, wallpaper format, quality mode, enabled widgets, and redacted errors. Do not upload private or copyrighted wallpaper packages.

@@ -1,0 +1,38 @@
+name: macOS
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          swift --version
+          xcrun swift-format --version
+      - name: Format
+        run: ./scripts/format.sh --check
+      - name: Tests
+        run: swift test --jobs 2
+      - name: Package development app
+        run: |
+          ./scripts/build-app.sh
+          ditto -c -k --keepParent dist/Ambient.app dist/Ambient-development.zip
+      - name: Upload development build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Ambient-development-arm64
+          path: dist/Ambient-development.zip
+          retention-days: 7
+          if-no-files-found: error
