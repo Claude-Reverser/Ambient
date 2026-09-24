@@ -1,9 +1,7 @@
 import SwiftUI
 
 struct WidgetStudio: View {
-    @ObservedObject var widgets: DesktopWidgets
-    @State private var draft = CustomWidgetPackage.starter
-    @State private var editorTab = "HTML"
+    @EnvironmentObject var widgets: DesktopWidgets
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
@@ -37,61 +35,12 @@ struct WidgetStudio: View {
                     Spacer()
                     Button("Reset sizes & positions") { widgets.resetLayout() }
                 }
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Build your own").font(.headline)
-                            Text("Style a widget with HTML and CSS, then apply it to your desktop.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Button("Import JSON") {
-                            if let imported = widgets.importCustom() { draft = imported }
-                        }
-                        Button("Export JSON") { widgets.exportCustom(draft) }
-                    }
-                    HStack {
-                        TextField("Widget name", text: $draft.name).textFieldStyle(.roundedBorder)
-                        Text("Height").foregroundStyle(.secondary)
-                        TextField("Height", value: $draft.height, format: .number).frame(width: 65)
-                            .textFieldStyle(.roundedBorder)
-                        Text("pt").foregroundStyle(.secondary)
-                    }
-                    Picker("Code", selection: $editorTab) {
-                        Text("HTML").tag("HTML")
-                        Text("CSS").tag("CSS")
-                    }.pickerStyle(.segmented).frame(width: 200)
-                    TextEditor(text: editorTab == "HTML" ? $draft.html : $draft.css)
-                        .font(.system(size: 12, design: .monospaced)).scrollContentBackground(
-                            .hidden
-                        )
-                        .padding(10).frame(height: 260).background(
-                            .black.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
-                    Text(
-                        "Live fields: data-ambient=\"time\", \"date\", \"cpu\", \"memory\", \"download\", \"upload\". CSS receives --cpu and --memory as percentages. Use inline HTML/CSS or embedded data images. External resources and page JavaScript are disabled."
-                    )
-                    .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    if let error = widgets.error {
-                        Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
-                    }
-                    HStack {
-                        Button("Load starter") { draft = .starter }
-                        Text(draft == widgets.custom ? "Saved" : "Unapplied changes").font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Apply code") {
-                            widgets.applyCustom(draft)
-                            if widgets.error == nil { widgets.customEnabled = true }
-                        }.buttonStyle(VioletButtonStyle())
-                    }
-                }.padding(20).background(
-                    AmbientTheme.surface, in: RoundedRectangle(cornerRadius: 16))
+                CustomWidgetEditor(widgets: widgets)
                 Text(
                     "Network shows combined Ethernet/Wi-Fi traffic (not per-app), avoiding VPN double-counting. CPU is the average over each sample interval. RAM estimates active, wired and compressed physical memory; it differs from Activity Monitor’s Memory Used. Custom web widgets use more resources than native widgets."
                 ).font(.caption).foregroundStyle(.secondary)
             }.padding(26)
-        }.background(AmbientTheme.background).onAppear { draft = widgets.custom }
+        }.background(AmbientTheme.background)
     }
     private func independentCard(_ kind: WidgetKind) -> some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -132,4 +81,79 @@ struct WidgetStudio: View {
                     widgets.enabled(kind) ? AmbientTheme.accent.opacity(0.4) : AmbientTheme.border))
     }
 
+}
+
+// The editor holds large HTML/CSS text. It reads DesktopWidgets without observing it, so moving
+// a size slider or toggling a widget does not re-render the text editor. Only the small status
+// views below observe widget state.
+private struct CustomWidgetEditor: View {
+    let widgets: DesktopWidgets
+    @State private var draft = CustomWidgetPackage.starter
+    @State private var editorTab = "HTML"
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Build your own").font(.headline)
+                    Text("Style a widget with HTML and CSS, then apply it to your desktop.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Import JSON") {
+                    if let imported = widgets.importCustom() { draft = imported }
+                }
+                Button("Export JSON") { widgets.exportCustom(draft) }
+            }
+            HStack {
+                TextField("Widget name", text: $draft.name).textFieldStyle(.roundedBorder)
+                Text("Height").foregroundStyle(.secondary)
+                TextField("Height", value: $draft.height, format: .number).frame(width: 65)
+                    .textFieldStyle(.roundedBorder)
+                Text("pt").foregroundStyle(.secondary)
+            }
+            Picker("Code", selection: $editorTab) {
+                Text("HTML").tag("HTML")
+                Text("CSS").tag("CSS")
+            }.pickerStyle(.segmented).frame(width: 200)
+            TextEditor(text: editorTab == "HTML" ? $draft.html : $draft.css)
+                .font(.system(size: 12, design: .monospaced)).scrollContentBackground(
+                    .hidden
+                )
+                .padding(10).frame(height: 260).background(
+                    .black.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
+            Text(
+                "Live fields: data-ambient=\"time\", \"date\", \"cpu\", \"memory\", \"download\", \"upload\". CSS receives --cpu and --memory as percentages. Use inline HTML/CSS or embedded data images. External resources and page JavaScript are disabled."
+            )
+            .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            WidgetErrorText(widgets: widgets)
+            HStack {
+                Button("Load starter") { draft = .starter }
+                DraftStatus(widgets: widgets, draft: draft)
+                Spacer()
+                Button("Apply code") {
+                    widgets.applyCustom(draft)
+                    if widgets.error == nil { widgets.customEnabled = true }
+                }.buttonStyle(VioletButtonStyle())
+            }
+        }.padding(20).background(
+            AmbientTheme.surface, in: RoundedRectangle(cornerRadius: 16)
+        ).onAppear { draft = widgets.custom }
+    }
+}
+private struct WidgetErrorText: View {
+    @ObservedObject var widgets: DesktopWidgets
+    var body: some View {
+        if let error = widgets.error {
+            Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+        }
+    }
+}
+private struct DraftStatus: View {
+    @ObservedObject var widgets: DesktopWidgets
+    let draft: CustomWidgetPackage
+    var body: some View {
+        Text(draft == widgets.custom ? "Saved" : "Unapplied changes").font(.caption)
+            .foregroundStyle(.secondary)
+    }
 }

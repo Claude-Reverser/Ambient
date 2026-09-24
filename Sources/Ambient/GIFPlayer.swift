@@ -91,6 +91,11 @@ struct GIFTimeline {
         ) { [weak self] _ in MainActor.assumeIsolated { self?.tick() } }
         timer?.tolerance = 0.003
     }
+    func setVisible(_ visible: Bool) {
+        timer?.invalidate()
+        timer = nil
+        if visible { tick() }
+    }
     func stop() {
         timer?.invalidate()
         timer = nil

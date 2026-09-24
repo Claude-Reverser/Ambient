@@ -2,7 +2,7 @@ import SwiftUI
 
 struct StudioOverview: View {
     @ObservedObject var library: Library
-    @ObservedObject var widgets: DesktopWidgets
+    @EnvironmentObject var widgets: DesktopWidgets
     let showWallpapers: () -> Void
     let showWidgets: () -> Void
     var body: some View {

@@ -64,3 +64,7 @@ Average GPU command duration was 1.70 ms per frame, and scene texture allocation
 ## 0.4.4 memory-warning behavior
 
 A real memory warning was observed stopping the user's 1080p video while Ambient remained alive. Warnings now purge thumbnail caches without setting the playback pause condition. Critical pressure still releases playback resources; recovery requires 20 seconds at normal pressure. Repeated normal events no longer restart that recovery timer, and critical events take precedence if flags are coalesced. No resolution or frame-rate reduction is applied. Earlier benchmark descriptions of warning-triggered pauses describe older versions.
+
+## 0.4.5 widget responsiveness
+
+Enabling a widget, entering or leaving edit mode, and changing a size no longer rebuild every widget window. Existing windows, hosting views and custom web views are kept; only widgets that are added or removed are created or closed. Size slider changes save once the value settles. The library window no longer re-renders on widget changes, and the custom HTML editor no longer re-renders while a slider moves. Widget sampling is skipped while every widget is covered and Ambient is not in front. The clock updates as soon as a widget is uncovered. These changes have not been benchmarked yet.

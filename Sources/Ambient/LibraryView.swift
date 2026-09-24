@@ -3,8 +3,10 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct LibraryView: View {
+    // Widget state is read by the widget views themselves. Observing DesktopWidgets here made
+    // every widget toggle or size change re-render the whole library, including the wallpaper
+    // grid and its filtering/sorting.
     @EnvironmentObject var library: Library
-    @EnvironmentObject var widgets: DesktopWidgets
     @State private var page = "Overview"
     @State private var search = ""
     @State private var filter: WallpaperFilter = .all
@@ -39,10 +41,10 @@ struct LibraryView: View {
             sidebar.navigationSplitViewColumnWidth(min: 230, ideal: 245, max: 270)
         } detail: {
             if page == "Widgets" {
-                WidgetStudio(widgets: widgets)
+                WidgetStudio()
             } else if page == "Overview" {
                 StudioOverview(
-                    library: library, widgets: widgets, showWallpapers: { page = "Wallpapers" },
+                    library: library, showWallpapers: { page = "Wallpapers" },
                     showWidgets: { page = "Widgets" })
             } else {
                 VStack(alignment: .leading, spacing: 18) {
@@ -203,7 +205,7 @@ struct LibraryView: View {
                             active: page == "Overview"
                         ) { page = "Overview" }
                         navigationRow(
-                            "Widgets", icon: "rectangle.3.group", count: widgets.enabledCount,
+                            "Widgets", icon: "rectangle.3.group", count: Self.liveWidgetCount,
                             active: page == "Widgets"
                         ) { page = "Widgets" }
                         navigationRow(
@@ -292,6 +294,8 @@ struct LibraryView: View {
             }.background(AmbientTheme.surface.ignoresSafeArea(edges: .top))
         }
     }
+    // Placeholder count: the row renders the enabled widget count from its own observing view.
+    private static let liveWidgetCount = -2
     private func navigationRow(
         _ title: String, icon: String, count: Int, active: Bool, action: @escaping () -> Void
     ) -> some View {
@@ -300,7 +304,9 @@ struct LibraryView: View {
                 Image(systemName: icon).frame(width: 16)
                 Text(title)
                 Spacer()
-                if count >= 0 {
+                if count == Self.liveWidgetCount {
+                    EnabledWidgetCount(active: active)
+                } else if count >= 0 {
                     Text("\(count)").font(.system(size: 10).monospacedDigit()).foregroundStyle(
                         active ? AmbientTheme.lavender : .secondary)
                 }
@@ -461,5 +467,14 @@ struct LibraryView: View {
             Button("Got it") { showCompatibility = false }.buttonStyle(VioletButtonStyle()).frame(
                 maxWidth: .infinity, alignment: .trailing)
         }.padding(30).frame(width: 520).background(AmbientTheme.surface)
+    }
+}
+
+private struct EnabledWidgetCount: View {
+    @EnvironmentObject var widgets: DesktopWidgets
+    let active: Bool
+    var body: some View {
+        Text("\(widgets.enabledCount)").font(.system(size: 10).monospacedDigit()).foregroundStyle(
+            active ? AmbientTheme.lavender : .secondary)
     }
 }

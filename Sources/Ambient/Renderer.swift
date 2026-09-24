@@ -47,6 +47,8 @@ final class VideoView: NSView {
     private var healthTimer: Timer?
     private var health = VideoHealth()
     private var onEvent: ((String) -> Void)?
+    private var visible = true
+    private var occlusionObserver: NSObjectProtocol?
     var hasLiveResources: Bool {
         player != nil || web != nil || gif != nil || scene != nil || preparedScene != nil
             || window.contentView != nil
@@ -79,9 +81,15 @@ final class VideoView: NSView {
         window.backgroundColor = .black
         window.contentView = nil
         window.setFrame(screen.frame, display: true)
+        occlusionObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.occlusionChanged() } }
         if !initiallyPaused { setPaused(false) }
     }
     private func load() {
+        // The window was ordered out while paused. Assume it is visible again; the occlusion
+        // notification corrects this once the window server has placed it.
+        visible = true
         switch wallpaper.kind {
         case .video:
             let view = VideoView(frame: NSRect(origin: .zero, size: window.frame.size))
@@ -103,7 +111,7 @@ final class VideoView: NSView {
                     to: resumeTime, toleranceBefore: CMTime(seconds: 0.2, preferredTimescale: 600),
                     toleranceAfter: CMTime(seconds: 0.2, preferredTimescale: 600))
             }
-            player.play()
+            if visible { player.play() }
             let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.checkVideoHealth() }
             }
@@ -144,6 +152,7 @@ final class VideoView: NSView {
                     gif = animation
                     window.contentView = animation.view
                     animation.play()
+                    if !visible { animation.setVisible(false) }
                 } catch { Task { [weak self] in self?.onError?(error.localizedDescription) } }
             } else {
                 loadWeb()
@@ -160,6 +169,21 @@ final class VideoView: NSView {
         scene = player
         window.contentView = player.view
         player.play()
+        if !visible { player.setVisible(false) }
+    }
+    // A wallpaper fully covered by other windows (a full-screen app, a maximized window) is not
+    // worth decoding or drawing. Web wallpapers are left alone; WebKit throttles hidden pages.
+    private func occlusionChanged() {
+        let visible = window.occlusionState.contains(.visible)
+        guard visible != self.visible else { return }
+        self.visible = visible
+        guard !paused, !stopped else { return }
+        scene?.setVisible(visible)
+        gif?.setVisible(visible)
+        if let player {
+            health = VideoHealth()
+            if visible { player.play() } else { player.pause() }
+        }
     }
     private func loadWeb() {
         let configuration = WKWebViewConfiguration()
@@ -175,7 +199,7 @@ final class VideoView: NSView {
             allowingReadAccessTo: URL(fileURLWithPath: wallpaper.root, isDirectory: true))
     }
     func checkVideoHealth() {
-        guard !paused, !stopped, let player else { return }
+        guard !paused, !stopped, visible, let player else { return }
         let failed =
             player.status == .failed || player.currentItem?.status == .failed
             || looper?.status == .failed
@@ -238,6 +262,8 @@ final class VideoView: NSView {
     func stop() {
         stopped = true
         paused = true
+        if let occlusionObserver { NotificationCenter.default.removeObserver(occlusionObserver) }
+        occlusionObserver = nil
         releaseResources()
         onError = nil
         onEvent = nil

@@ -25,19 +25,38 @@ struct DesktopWidgetSettings: Codable, Equatable {
     let readings = SystemReadings()
     private let defaults: UserDefaults
     private var positions: [String: WidgetPosition]
-    private(set) var windows: [NSWindow] = []
-    private var customHosts: [CustomWidgetHost] = []
-    private struct WindowRecord {
+    var windows: [NSWindow] { records.map(\.window) }
+    // One live window per widget and display. Windows, hosting views and custom web views are
+    // kept across toggles, edit mode and resizing; only widgets that appear or disappear are
+    // created or closed. Recreating every WKWebView and hosting view on each click was the main
+    // source of UI stalls.
+    @MainActor private final class WindowRecord {
         let kind: WidgetKind
         let key: String
-        let area: NSRect
+        var area: NSRect
         let window: NSWindow
-        let native: NSHostingView<AnyView>?
+        let container: NSView
+        let face: WidgetFaceState?
         let custom: CustomWidgetHost?
+        var drag: WidgetDragSurface?
+        init(
+            kind: WidgetKind, key: String, area: NSRect, window: NSWindow, container: NSView,
+            face: WidgetFaceState?, custom: CustomWidgetHost?
+        ) {
+            self.kind = kind
+            self.key = key
+            self.area = area
+            self.window = window
+            self.container = container
+            self.face = face
+            self.custom = custom
+        }
     }
     private var records: [WindowRecord] = []
     private var editPanel: NSPanel?
     private var timer: Timer?
+    private var timerSamplesStats: Bool?
+    private var pendingSave: Task<Void, Never>?
     private var sleeping = false
     private var inactive = false
     var customEnabled: Bool {
@@ -58,24 +77,25 @@ struct DesktopWidgetSettings: Codable, Equatable {
         var placement = placements[kind.rawValue] ?? WidgetPlacement()
         placement.scale = value
         placements[kind.rawValue] = placement
-        saveLayout()
-        resize(kind)
+        // Sliders call this for every movement; write preferences once the value settles.
+        scheduleSave()
+        for record in records where record.kind == kind { layout(record) }
     }
-    private func resize(_ kind: WidgetKind) {
-        for record in records where record.kind == kind {
-            let wanted = kind.size(customHeight: custom.height)
-            let scale = min(
-                max(0.6, min(2.5, self.scale(kind))), record.area.width / wanted.width,
-                record.area.height / wanted.height)
-            let size = NSSize(width: wanted.width * scale, height: wanted.height * scale)
-            let position = positions[record.key] ?? .initial(kind)
-            let frame = position.frame(size: size, area: record.area)
-            record.native?.rootView = AnyView(
-                SingleWidgetFace(readings: readings, kind: kind, scale: scale).frame(
-                    width: size.width, height: size.height))
-            record.custom?.view.pageZoom = scale
-            record.window.setFrame(frame, display: false)
+    private func layout(_ record: WindowRecord) {
+        let wanted = record.kind.size(customHeight: custom.height)
+        let scale = min(
+            max(0.6, min(2.5, self.scale(record.kind))), record.area.width / wanted.width,
+            record.area.height / wanted.height)
+        let size = NSSize(width: wanted.width * scale, height: wanted.height * scale)
+        let position = positions[record.key] ?? .initial(record.kind)
+        let frame = position.frame(size: size, area: record.area)
+        if let face = record.face, face.scale != scale || face.size != size {
+            face.scale = scale
+            face.size = size
         }
+        if let web = record.custom?.view, web.pageZoom != scale { web.pageZoom = scale }
+        record.drag?.dragBounds = record.area
+        if record.window.frame != frame { record.window.setFrame(frame, display: false) }
     }
     func resetLayout() {
         positions = [:]
@@ -119,6 +139,9 @@ struct DesktopWidgetSettings: Codable, Equatable {
         NotificationCenter.default.addObserver(
             self, selector: #selector(rebuild),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(occlusionChanged(_:)),
+            name: NSWindow.didChangeOcclusionStateNotification, object: nil)
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(
             self, selector: #selector(sleep), name: NSWorkspace.screensDidSleepNotification,
@@ -136,6 +159,7 @@ struct DesktopWidgetSettings: Codable, Equatable {
     }
     deinit {
         timer?.invalidate()
+        pendingSave?.cancel()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
@@ -144,7 +168,17 @@ struct DesktopWidgetSettings: Codable, Equatable {
             defaults.set(data, forKey: "desktopWidgets")
         }
     }
+    private func scheduleSave() {
+        pendingSave?.cancel()
+        pendingSave = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            self?.saveLayout()
+        }
+    }
     private func saveLayout() {
+        pendingSave?.cancel()
+        pendingSave = nil
         if let data = try? JSONEncoder().encode(placements) {
             defaults.set(data, forKey: "independentWidgets")
         }
@@ -180,89 +214,141 @@ struct DesktopWidgetSettings: Codable, Equatable {
         inactive = false
         rebuild()
     }
-    @objc private func rebuild() {
-        timer?.invalidate()
-        timer = nil
-        editPanel?.close()
-        editPanel = nil
-        for host in customHosts { host.stop() }
-        customHosts.removeAll()
-        for window in windows {
-            window.contentView = nil
-            window.close()
-        }
-        windows.removeAll()
-        records.removeAll()
-        readings.resetBaseline()
-        guard !sleeping, !inactive else { return }
-        let screens = settings.allDisplays ? NSScreen.screens : Array(NSScreen.screens.prefix(1))
-        for screen in screens {
-            let area = screen.visibleFrame
-            let display =
-                (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
-                .stringValue ?? "main"
-            for kind in WidgetKind.allCases where enabled(kind) {
-                let wanted = kind.size(customHeight: custom.height)
-                let scale = min(
-                    max(0.6, min(2.5, self.scale(kind))), area.width / wanted.width,
-                    area.height / wanted.height)
-                let size = NSSize(width: wanted.width * scale, height: wanted.height * scale)
-                let key = kind.rawValue + "@" + display
-                let position = positions[key] ?? .initial(kind)
-                let frame = position.frame(size: size, area: area)
-                let window = makeWindow(frame)
-                window.title = kind.title
-                window.identifier = NSUserInterfaceItemIdentifier("widget-" + key)
-                let container = NSView(frame: NSRect(origin: .zero, size: size))
-                let content: NSView
-                var native: NSHostingView<AnyView>?
-                var customHost: CustomWidgetHost?
-                if kind == .custom {
-                    let host = CustomWidgetHost(package: custom, size: size, scale: scale)
-                    host.error = { [weak self] in self?.error = $0 }
-                    customHosts.append(host)
-                    customHost = host
-                    content = host.view
-                } else {
-                    let host = NSHostingView(
-                        rootView: AnyView(
-                            SingleWidgetFace(readings: readings, kind: kind, scale: scale).frame(
-                                width: size.width, height: size.height)))
-                    host.sizingOptions = []
-                    native = host
-                    content = host
+    @objc private func rebuild() { reconcile() }
+    // Updates are skipped while every widget is covered. Bring the clock up to date the moment one
+    // is uncovered; metrics follow on the next 500 ms tick.
+    @objc private func occlusionChanged(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+            window.occlusionState.contains(.visible),
+            records.contains(where: { $0.window === window })
+        else { return }
+        readings.refresh(stats: false)
+    }
+    private func reconcile(recreateCustom: Bool = false) {
+        var wanted: [(key: String, kind: WidgetKind, area: NSRect)] = []
+        if !sleeping, !inactive {
+            let screens =
+                settings.allDisplays ? NSScreen.screens : Array(NSScreen.screens.prefix(1))
+            for screen in screens {
+                let display =
+                    (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
+                    as? NSNumber)?.stringValue ?? "main"
+                for kind in WidgetKind.allCases where enabled(kind) {
+                    wanted.append((kind.rawValue + "@" + display, kind, screen.visibleFrame))
                 }
-                content.frame = container.bounds
-                content.autoresizingMask = [.width, .height]
-                container.addSubview(content)
-                if editing {
-                    let drag = WidgetDragSurface(frame: container.bounds)
-                    drag.dragBounds = area
-                    drag.autoresizingMask = [.width, .height]
-                    drag.setAccessibilityLabel("Drag " + kind.title)
-                    drag.didDrag = { [weak self, weak window] moved in
-                        guard let self, let window else { return }
-                        let position = WidgetPosition.from(frame: moved, area: area)
-                        self.positions[key] = position
-                        self.saveLayout()
-                        window.setFrame(
-                            position.frame(size: window.frame.size, area: area), display: true)
-                    }
-                    container.addSubview(drag)
-                }
-                window.contentView = container
-                window.orderFrontRegardless()
-                windows.append(window)
-                records.append(
-                    WindowRecord(
-                        kind: kind, key: key, area: area, window: window, native: native,
-                        custom: customHost))
             }
         }
-        if editing { showEditPanel() }
-        guard enabledCount > 0 else { return }
+        records.removeAll { record in
+            let keep =
+                wanted.contains { $0.key == record.key }
+                && !(recreateCustom && record.kind == .custom)
+            if !keep { close(record) }
+            return !keep
+        }
+        for item in wanted {
+            if let record = records.first(where: { $0.key == item.key }) {
+                record.area = item.area
+                layout(record)
+                applyEditing(record)
+            } else {
+                records.append(makeRecord(key: item.key, kind: item.kind, area: item.area))
+            }
+        }
+        if editing {
+            if editPanel == nil { showEditPanel() }
+        } else {
+            editPanel?.close()
+            editPanel = nil
+        }
+        updateTimer()
+    }
+    private func close(_ record: WindowRecord) {
+        record.custom?.stop()
+        record.drag?.removeFromSuperview()
+        record.window.contentView = nil
+        record.window.close()
+    }
+    private func makeRecord(key: String, kind: WidgetKind, area: NSRect) -> WindowRecord {
+        let window = makeWindow(NSRect(origin: area.origin, size: NSSize(width: 1, height: 1)))
+        window.title = kind.title
+        window.identifier = NSUserInterfaceItemIdentifier("widget-" + key)
+        let wanted = kind.size(customHeight: custom.height)
+        let container = NSView(frame: NSRect(origin: .zero, size: wanted))
+        let content: NSView
+        var face: WidgetFaceState?
+        var customHost: CustomWidgetHost?
+        if kind == .custom {
+            let host = CustomWidgetHost(package: custom, size: wanted, scale: 1)
+            host.error = { [weak self] in self?.error = $0 }
+            host.onReady = { [weak self, weak host] in
+                if let self { host?.update(self.readings) }
+            }
+            customHost = host
+            content = host.view
+        } else {
+            let state = WidgetFaceState(scale: 1, size: wanted)
+            let host = NSHostingView(
+                rootView: WidgetFaceRoot(readings: readings, kind: kind, state: state))
+            host.sizingOptions = []
+            face = state
+            content = host
+        }
+        content.frame = container.bounds
+        content.autoresizingMask = [.width, .height]
+        container.addSubview(content)
+        window.contentView = container
+        let record = WindowRecord(
+            kind: kind, key: key, area: area, window: window, container: container, face: face,
+            custom: customHost)
+        layout(record)
+        applyEditing(record)
+        window.orderFrontRegardless()
+        return record
+    }
+    private func applyEditing(_ record: WindowRecord) {
+        let level = NSWindow.Level(
+            rawValue: editing
+                ? Int(CGWindowLevelForKey(.desktopIconWindow)) + 1
+                : Int(CGWindowLevelForKey(.desktopWindow)) + 2)
+        if record.window.level != level {
+            record.window.level = level
+            record.window.orderFrontRegardless()
+        }
+        record.window.ignoresMouseEvents = !editing
+        if editing, record.drag == nil {
+            let drag = WidgetDragSurface(frame: record.container.bounds)
+            drag.dragBounds = record.area
+            drag.autoresizingMask = [.width, .height]
+            drag.setAccessibilityLabel("Drag " + record.kind.title)
+            drag.didDrag = { [weak self, weak record] moved in
+                guard let self, let record else { return }
+                let position = WidgetPosition.from(frame: moved, area: record.area)
+                self.positions[record.key] = position
+                self.saveLayout()
+                record.window.setFrame(
+                    position.frame(size: record.window.frame.size, area: record.area),
+                    display: true)
+            }
+            record.container.addSubview(drag)
+            record.drag = drag
+        } else if !editing, let drag = record.drag {
+            drag.removeFromSuperview()
+            record.drag = nil
+        }
+    }
+    // Clock and date only need a tick per minute; live metrics need 500 ms sampling. The timer is
+    // only replaced when that requirement changes, so unrelated edits keep the sample baseline.
+    private func updateTimer() {
+        let stats: Bool? =
+            records.isEmpty
+            ? nil : enabled(.cpu) || enabled(.memory) || enabled(.network) || customEnabled
+        guard stats != timerSamplesStats || (stats != nil && timer == nil) else { return }
+        timer?.invalidate()
+        timer = nil
+        timerSamplesStats = stats
+        guard let stats else { return }
+        if stats { readings.resetBaseline() }
         refresh()
-        let stats = enabled(.cpu) || enabled(.memory) || enabled(.network) || customEnabled
         let interval: TimeInterval = stats ? 0.5 : 60
         let firstFire =
             stats
@@ -271,22 +357,17 @@ struct DesktopWidgetSettings: Codable, Equatable {
         let timer = Timer(fire: firstFire, interval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
-        timer.tolerance = stats ? 0.025 : 1
+        timer.tolerance = stats ? 0.05 : 1
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
     }
     private func makeWindow(_ frame: NSRect) -> NSWindow {
         let window = DesktopWindow(
             contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        window.level = NSWindow.Level(
-            rawValue: editing
-                ? Int(CGWindowLevelForKey(.desktopIconWindow)) + 1
-                : Int(CGWindowLevelForKey(.desktopWindow)) + 2)
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
-        window.ignoresMouseEvents = !editing
         window.isReleasedWhenClosed = false
         return window
     }
@@ -320,16 +401,22 @@ struct DesktopWidgetSettings: Codable, Equatable {
         editPanel = panel
     }
     private func refresh() {
+        // Widgets sit on the desktop. When every one is covered and the library is not in front,
+        // nobody can see an update; skip the sampling and redraw work entirely.
+        guard
+            NSApp.isActive
+                || records.contains(where: { $0.window.occlusionState.contains(.visible) })
+        else { return }
         readings.refresh(
             stats: enabled(.cpu) || enabled(.memory) || enabled(.network) || customEnabled)
-        for host in customHosts { host.update(readings) }
+        for record in records { record.custom?.update(readings) }
     }
     func applyCustom(_ package: CustomWidgetPackage) {
         do {
             custom = try package.validated()
             defaults.set(try JSONEncoder().encode(custom), forKey: "customWidgetPackage")
             error = nil
-            rebuild()
+            reconcile(recreateCustom: true)
         } catch { self.error = error.localizedDescription }
     }
     func importCustom() -> CustomWidgetPackage? {

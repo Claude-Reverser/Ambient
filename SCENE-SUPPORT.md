@@ -60,3 +60,12 @@ Set `AMBIENT_SCENE_QA` to an existing scratch directory to save GPU frame snapsh
 Water Flow now uses a single texture level for its image input and authored vector map. The previous implementation generated mip chains for both embedded PNGs and allowed implicit mip selection during displacement, introducing filtering absent from the single-level effect framebuffer and the Waves flow map. Static image scenes retain generated mipmaps. No new third-party source code was copied.
 
 References inspected: [Wallpaper Engine texture uniforms](https://docs.wallpaperengine.io/en/scene/shader/variables.html), [linux-wallpaperengine framebuffer setup](https://github.com/Almamu/linux-wallpaperengine/blob/master/src/WallpaperEngine/Render/CFBO.cpp), and [texture loading](https://github.com/Almamu/linux-wallpaperengine/blob/master/src/WallpaperEngine/Render/CTexture.cpp). This corrects a verified sampling difference; visual parity with the Windows renderer remains unverified. The 0.4 benchmark predates this correction.
+
+## 0.4.5 renderer corrections
+
+- **Edge sampling:** Water Flow's image input now clamps at the image edge, matching the layer framebuffer the effect reads. It previously used the texture's repeat mode, so displaced samples at the screen edges could pull in pixels from the opposite side. Samples are also kept inside the image when its texture is padded.
+- **Long-running precision:** Flow phases are computed on the CPU in double precision and wrapped before reaching the GPU. Single-precision `fract(time * speed)` lost sub-frame precision after long uptimes, making motion step.
+- **Cost:** Colors use half precision, pixels with no flow skip the four displaced reads, and the compiled pipeline is cached per GPU instead of being recompiled on every resume.
+- **Hidden wallpapers:** Scene, GIF and video wallpapers stop drawing or decoding while their window is fully covered, for example by a full-screen app. They resume when uncovered. Web wallpapers rely on WebKit's own throttling.
+
+These changes do not add new supported effects. Parity with the Windows renderer remains unverified.

@@ -19,13 +19,8 @@ final class SceneResources: @unchecked Sendable {
             throw SceneError.invalid("Metal queue unavailable")
         }
         self.queue = queue
-        let shader = try device.makeLibrary(source: Self.shader, options: nil)
-        let descriptor = MTLRenderPipelineDescriptor()
-        descriptor.vertexFunction = shader.makeFunction(name: "sceneVertex")
-        descriptor.fragmentFunction = shader.makeFunction(
-            name: description.animated ? "waterFragment" : "imageFragment")
-        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-        pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+        pipeline = try ScenePipelineCache.shared.pipeline(
+            device: device, fragment: description.animated ? "waterFragment" : "imageFragment")
         var loaded: [MTLTexture] = []
         var sampling: [MTLSamplerState] = []
         var ratios: [SIMD2<Float>] = []
@@ -86,7 +81,11 @@ final class SceneResources: @unchecked Sendable {
             // Synthesized mips change flow vectors and blur displaced samples.
             sampler.mipFilter =
                 description.animated ? .notMipmapped : (payload.flags & 1 == 1 ? .nearest : .linear)
-            sampler.sAddressMode = payload.flags & 2 == 2 ? .clampToEdge : .repeat
+            // The water pass reads the layer framebuffer, which clamps at the image edge. Repeating
+            // would pull pixels from the opposite side of the screen into displaced edge samples.
+            sampler.sAddressMode =
+                payload.flags & 2 == 2 || (description.animated && loaded.isEmpty)
+                ? .clampToEdge : .repeat
             sampler.tAddressMode = sampler.sAddressMode
             guard let state = device.makeSamplerState(descriptor: sampler) else {
                 throw SceneError.invalid("sampler allocation failed")
@@ -106,18 +105,38 @@ final class SceneResources: @unchecked Sendable {
         var crop: SIMD2<Float>
         var baseScale: SIMD2<Float>
         var maskScale: SIMD2<Float>
-        var motion: SIMD4<Float>
+        var weights: SIMD2<Float>
+        var offsets: SIMD4<Float>
+        var baseLimit: SIMD2<Float>
+        var phaseScale: Float
     }
-    func encode(_ encoder: MTLRenderCommandEncoder, time: Float, size: CGSize) {
+    // Per-frame values that depend only on time are computed once here, in double precision,
+    // instead of per pixel. Float time loses sub-frame precision after long uptimes and made
+    // fract(time * speed) step visibly; wrapping the phase on the CPU keeps motion smooth.
+    func uniforms(time: Double, size: CGSize) -> Uniforms {
         let displayAspect = Float(size.width / max(1, size.height))
         let sceneAspect = Float(description.width) / Float(description.height)
         let crop =
             displayAspect > sceneAspect
             ? SIMD2<Float>(1, sceneAspect / displayAspect)
             : SIMD2<Float>(displayAspect / sceneAspect, 1)
-        var uniforms = Uniforms(
-            crop: crop, baseScale: scales[0], maskScale: scales.count > 1 ? scales[1] : SIMD2(1, 1),
-            motion: SIMD4(time, description.speed, description.strength, description.phaseScale))
+        let cycle = time * Double(description.speed)
+        let cycles = SIMD4<Float>(
+            Self.fract(cycle), Self.fract(cycle + 0.5), Self.fract(cycle + 0.25),
+            Self.fract(cycle + 0.75))
+        let base = textures[0]
+        // Keep displaced samples inside the image when its texture is padded.
+        let halfTexel = SIMD2<Float>(0.5 / Float(base.width), 0.5 / Float(base.height))
+        return Uniforms(
+            crop: crop, baseScale: scales[0],
+            maskScale: scales.count > 1 ? scales[1] : SIMD2(1, 1),
+            weights: SIMD2(2 * abs(cycles.x - 0.5), 2 * abs(cycles.z - 0.5)),
+            offsets: (cycles - 0.5) * description.strength * 0.1,
+            baseLimit: scales[0] - halfTexel, phaseScale: description.phaseScale)
+    }
+    static func fract(_ value: Double) -> Float { Float(value - value.rounded(.down)) }
+    func encode(_ encoder: MTLRenderCommandEncoder, time: Double, size: CGSize) {
+        var uniforms = uniforms(time: time, size: size)
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
         for index in textures.indices {
@@ -127,33 +146,65 @@ final class SceneResources: @unchecked Sendable {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
     }
     // Equivalent math to the verified waterflow shader. No imported shader text is executed.
+    // Colors use half precision (8-bit sources); flow vectors stay in float so the 0.498 rest
+    // value is exact. Pixels without flow skip the four displaced reads: the final mix would
+    // return the original color there anyway (difference below one 8-bit step).
     static let shader = """
         #include <metal_stdlib>
         using namespace metal;
         struct Vertex { float4 position [[position]]; float2 uv; };
-        struct Uniforms { float2 crop; float2 baseScale; float2 maskScale; float4 motion; };
+        struct Uniforms { float2 crop; float2 baseScale; float2 maskScale; float2 weights; float4 offsets; float2 baseLimit; float phaseScale; };
         vertex Vertex sceneVertex(uint id [[vertex_id]]) {
             float2 p = float2((id << 1) & 2, id & 2);
             return { float4(p * 2.0 - 1.0, 0.0, 1.0), float2(p.x, 1.0 - p.y) };
         }
-        fragment float4 imageFragment(Vertex v [[stage_in]], constant Uniforms &u [[buffer(0)]], texture2d<float> image [[texture(0)]], sampler imageSampler [[sampler(0)]]) {
-            float2 uv = (v.uv - 0.5) * u.crop + 0.5;
-            return image.sample(imageSampler, uv * u.baseScale);
+        static inline half4 baseSample(texture2d<half> image, sampler s, float2 uv, constant Uniforms &u) {
+            return image.sample(s, min(uv * u.baseScale, u.baseLimit));
         }
-        fragment float4 waterFragment(Vertex v [[stage_in]], constant Uniforms &u [[buffer(0)]], texture2d<float> image [[texture(0)]], texture2d<float> mask [[texture(1)]], texture2d<float> phase [[texture(2)]], sampler imageSampler [[sampler(0)]], sampler maskSampler [[sampler(1)]], sampler phaseSampler [[sampler(2)]]) {
+        fragment half4 imageFragment(Vertex v [[stage_in]], constant Uniforms &u [[buffer(0)]], texture2d<half> image [[texture(0)]], sampler imageSampler [[sampler(0)]]) {
             float2 uv = (v.uv - 0.5) * u.crop + 0.5;
-            float noise = phase.sample(phaseSampler, uv * u.motion.w).r;
+            return baseSample(image, imageSampler, uv, u);
+        }
+        fragment half4 waterFragment(Vertex v [[stage_in]], constant Uniforms &u [[buffer(0)]], texture2d<half> image [[texture(0)]], texture2d<float> mask [[texture(1)]], texture2d<half> phase [[texture(2)]], sampler imageSampler [[sampler(0)]], sampler maskSampler [[sampler(1)]], sampler phaseSampler [[sampler(2)]]) {
+            float2 uv = (v.uv - 0.5) * u.crop + 0.5;
+            half4 original = baseSample(image, imageSampler, uv, u);
             float2 flow = (mask.sample(maskSampler, uv * u.maskScale).rg - float2(0.498)) * 2.0;
-            float4 cycles = fract(u.motion.x * u.motion.y + float4(0.0, 0.5, 0.25, 0.75));
-            float2 weights = 2.0 * abs(cycles.xz - 0.5);
-            cycles -= 0.5;
-            float2 delta = flow * u.motion.z * 0.1;
-            float4 a = mix(image.sample(imageSampler, (uv + delta * cycles.x) * u.baseScale), image.sample(imageSampler, (uv + delta * cycles.y) * u.baseScale), weights.x);
-            float4 b = mix(image.sample(imageSampler, (uv + delta * cycles.z) * u.baseScale), image.sample(imageSampler, (uv + delta * cycles.w) * u.baseScale), weights.y);
-            float4 original = image.sample(imageSampler, uv * u.baseScale);
-            return mix(original, mix(a, b, smoothstep(0.2, 0.8, noise)), length(flow));
+            float amount = length(flow);
+            if (amount < 0.002) { return original; }
+            half noise = phase.sample(phaseSampler, uv * u.phaseScale).r;
+            half4 a = mix(baseSample(image, imageSampler, uv + flow * u.offsets.x, u), baseSample(image, imageSampler, uv + flow * u.offsets.y, u), half(u.weights.x));
+            half4 b = mix(baseSample(image, imageSampler, uv + flow * u.offsets.z, u), baseSample(image, imageSampler, uv + flow * u.offsets.w, u), half(u.weights.y));
+            return mix(original, mix(a, b, smoothstep(half(0.2), half(0.8), noise)), half(amount));
         }
         """
+}
+// Compiling the Metal source takes tens of milliseconds. Pipelines are immutable, so compile each
+// once per device and reuse them across displays, pause/resume and wallpaper changes.
+final class ScenePipelineCache: @unchecked Sendable {
+    static let shared = ScenePipelineCache()
+    private let lock = NSLock()
+    private var libraries: [UInt64: MTLLibrary] = [:]
+    private var pipelines: [String: MTLRenderPipelineState] = [:]
+    func pipeline(device: MTLDevice, fragment: String) throws -> MTLRenderPipelineState {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = "\(device.registryID)|\(fragment)"
+        if let pipeline = pipelines[key] { return pipeline }
+        let library: MTLLibrary
+        if let cached = libraries[device.registryID] {
+            library = cached
+        } else {
+            library = try device.makeLibrary(source: SceneResources.shader, options: nil)
+            libraries[device.registryID] = library
+        }
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = library.makeFunction(name: "sceneVertex")
+        descriptor.fragmentFunction = library.makeFunction(name: fragment)
+        descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+        let pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+        pipelines[key] = pipeline
+        return pipeline
+    }
 }
 actor SceneLoader {
     static let shared = SceneLoader()
@@ -231,6 +282,11 @@ final class SceneMetrics: @unchecked Sendable {
         view.isPaused = !resources.description.animated
         view.needsDisplay = true
     }
+    // Hidden scenes (for example behind a full-screen app) stop the draw loop; time keeps running.
+    func setVisible(_ visible: Bool) {
+        guard !stopped, resources.description.animated else { return }
+        view.isPaused = !visible
+    }
     func stop() {
         stopped = true
         view.isPaused = true
@@ -260,7 +316,7 @@ final class SceneMetrics: @unchecked Sendable {
             inFlight.signal()
             return
         }
-        resources.encode(encoder, time: Float(elapsed), size: view.drawableSize)
+        resources.encode(encoder, time: elapsed, size: view.drawableSize)
         encoder.endEncoding()
         let semaphore = inFlight
         let metrics = metrics

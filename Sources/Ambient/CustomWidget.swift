@@ -57,6 +57,7 @@ struct CustomWidgetPackage: Codable, Equatable {
     private var failed = false
     private var didLoadInitialDocument = false
     var error: ((String) -> Void)?
+    var onReady: (() -> Void)?
     init(package: CustomWidgetPackage, size: NSSize, scale: Double) {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
@@ -100,11 +101,15 @@ struct CustomWidgetPackage: Codable, Equatable {
     }
     func stop() {
         ready = false
+        onReady = nil
         view.stopLoading()
         view.navigationDelegate = nil
         view.removeFromSuperview()
     }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { ready = true }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        ready = true
+        onReady?()
+    }
     func webView(
         _ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void

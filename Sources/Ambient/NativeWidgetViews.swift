@@ -1,3 +1,5 @@
+import AppKit
+import Observation
 import SwiftUI
 
 struct UsageGraph: View {
@@ -27,6 +29,25 @@ struct UsageGraph: View {
             }
         }.accessibilityLabel(
             "Network download and upload speed, last 60 seconds, automatically scaled")
+    }
+}
+// Scale and size live in a small observable model so resizing a desktop widget re-renders only
+// that widget instead of replacing its whole hosting view hierarchy.
+@MainActor @Observable final class WidgetFaceState {
+    var scale: Double
+    var size: NSSize
+    init(scale: Double, size: NSSize) {
+        self.scale = scale
+        self.size = size
+    }
+}
+struct WidgetFaceRoot: View {
+    let readings: SystemReadings
+    let kind: WidgetKind
+    let state: WidgetFaceState
+    var body: some View {
+        SingleWidgetFace(readings: readings, kind: kind, scale: state.scale).frame(
+            width: state.size.width, height: state.size.height)
     }
 }
 struct SingleWidgetFace: View {

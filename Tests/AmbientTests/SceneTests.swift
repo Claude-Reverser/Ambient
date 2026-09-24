@@ -113,7 +113,7 @@ final class SceneTests: XCTestCase {
             })
         XCTAssertThrowsError(try SceneDescription(package: ScenePackage(data: modified)))
     }
-    static func render(_ resources: SceneResources, time: Float, width: Int, height: Int) throws
+    static func render(_ resources: SceneResources, time: Double, width: Int, height: Int) throws
         -> Data
     {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
@@ -150,7 +150,12 @@ final class SceneTests: XCTestCase {
             "Top-left must be red, not vertically flipped or channel-swapped")
         XCTAssertEqual(Array(image[12..<16]), [0, 255, 0, 255])
         XCTAssertEqual(Array(image[48..<52]), [255, 0, 0, 255])
-        XCTAssertEqual(MemoryLayout<SceneResources.Uniforms>.stride, 48)
+        XCTAssertEqual(MemoryLayout<SceneResources.Uniforms>.stride, 64)
+    }
+    func testFlowPhaseStaysPreciseAfterLongUptime() {
+        XCTAssertEqual(SceneResources.fract(1_000_000.25), 0.25)
+        XCTAssertEqual(SceneResources.fract(2_592_000.75), 0.75)
+        XCTAssertEqual(SceneResources.fract(3), 0)
     }
     @MainActor func testScenePauseReleasesAndSharingUsesSameTextures() throws {
         guard let device = MTLCreateSystemDefaultDevice(), let screen = NSScreen.screens.first
